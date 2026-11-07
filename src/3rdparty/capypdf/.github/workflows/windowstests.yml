@@ -1,0 +1,40 @@
+name: CapyPDF CI - Windows
+run-name: ${{ github.actor }} unit tests for CapyPDF (Windows)
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+jobs:
+  CapyPDF-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup MS Build tools
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install meson and PIL
+        run: pip install meson Pillow
+
+      - name: Install ghostscript
+        run: |
+          choco install ghostscript --version 10.6.0 -y --no-progress
+          echo "C:\Program Files\gs\gs10.06.0\bin\" >> $env:GITHUB_PATH
+
+      - name: Configure
+        run: meson setup --buildtype=debugoptimized -Db_pch=false -Ddevtools=true -Ddefault_library=static -D:default_library=shared builddir
+
+      - name: Build
+        run: meson compile -C builddir
+
+      - name: Test
+        run: meson test capypdf:* -C builddir
+
+      - name: Print test log
+        if: failure()
+        run: cat builddir/meson-logs/testlog.txt

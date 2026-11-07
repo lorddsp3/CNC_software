@@ -1,0 +1,918 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/** @file
+ * TODO: insert short description here
+ *//*
+ * Authors:
+ *     fred
+ *     bulia byak <buliabyak@users.sf.net>
+ *
+ * Copyright (C) 2018 Authors
+ * Released under GNU GPL v2+, read the file 'COPYING' for more information.
+ */
+
+#include "font-instance.h"
+
+#ifdef HAVE_CONFIG_H
+# include "config.h"  // only include where actually required!
+#endif
+
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+
+#ifndef PANGO_ENABLE_ENGINE
+#define PANGO_ENABLE_ENGINE
+#endif
+
+#include <ft2build.h>
+#include FT_OUTLINE_H
+#include FT_BBOX_H
+#include FT_TRUETYPE_TAGS_H
+#include FT_TRUETYPE_TABLES_H
+#include FT_GLYPH_H
+
+#include <pango/pangoft2.h>
+#include <harfbuzz/hb.h>
+#ifdef WITH_HARFBUZZ_CAIRO
+#include <harfbuzz/hb-cairo.h> // Color fonts
+#endif
+#include <harfbuzz/hb-ft.h>
+#include <harfbuzz/hb-ot.h> // Color fonts
+
+#include <glibmm/regex.h>
+#include <glibmm/stringutils.h>
+#include <harfbuzz/hb-ft.h>
+#include <harfbuzz/hb-ot.h>
+#include <harfbuzz/hb.h>
+#include <pango/pangoft2.h>
+#include <pango/pango-types.h>
+#include <pangomm/fontdescription.h>
+#include <2geom/path-sink.h>
+#include <2geom/pathvector.h>
+#include <2geom/path-sink.h>
+
+/*
+ * Outline extraction
+ */
+
+struct HBGeomData
+{
+    HBGeomData(Geom::PathBuilder &b, double s)
+        : builder(b)
+        , scale(s)
+    {
+    }
+
+    Geom::PathBuilder &builder;
+    double scale;
+};
+
+static void hb_draw_move_to(hb_draw_funcs_t *dfuncs, // Unused
+                            void *draw_data,
+                            hb_draw_state_t *st, // Unused
+                            float to_x,
+                            float to_y,
+                            void *user_data) // Unused
+{
+    HBGeomData *draw = (HBGeomData*)draw_data;
+    Geom::Point p(to_x, to_y);
+    draw->builder.moveTo(p * draw->scale);
+}
+
+static void hb_draw_line_to(hb_draw_funcs_t *dfuncs, // Unused
+                            void *draw_data,
+                            hb_draw_state_t *st, // Unused
+                            float to_x,
+                            float to_y,
+                            void *user_data) // Unused
+{
+    HBGeomData *draw = (HBGeomData*)draw_data;
+    Geom::Point p(to_x, to_y);
+    draw->builder.lineTo(p * draw->scale);
+}
+
+static void hb_draw_quadratic_to(hb_draw_funcs_t *dfuncs, // Unused
+                                 void *draw_data,
+                                 hb_draw_state_t *st, // Unused
+                                 float control_x,
+                                 float control_y,
+                                 float to_x,
+                                 float to_y,
+                                 void *user_data) // Unused
+{
+    HBGeomData *draw = (HBGeomData*)draw_data;
+    Geom::Point p(to_x, to_y);
+    Geom::Point c(control_x, control_y);
+    draw->builder.quadTo(c * draw->scale, p * draw->scale);
+}
+
+static void hb_draw_cubic_to(hb_draw_funcs_t *dfuncs, // Unused
+                             void *draw_data,
+                             hb_draw_state_t *st, // Unused
+                             float control1_x,
+                             float control1_y,
+                             float control2_x,
+                             float control2_y,
+                             float to_x,
+                             float to_y,
+                             void *user_data) // Unused
+{
+    HBGeomData *draw = (HBGeomData*)draw_data;
+    Geom::Point p(to_x, to_y);
+    Geom::Point c1(control1_x, control1_y);
+    Geom::Point c2(control2_x, control2_y);
+    draw->builder.curveTo(c1 * draw->scale, c2 * draw->scale, p * draw->scale);
+}
+
+static void hb_draw_close_path(hb_draw_funcs_t *dfuncs, // Unused
+                               void *draw_data,
+                               hb_draw_state_t *st, // Unused
+                               void *user_data) // Unused
+{
+    HBGeomData *draw = (HBGeomData*)draw_data;
+    draw->builder.closePath();
+}
+
+FontInstance::FontInstance(PangoFont *p_font, PangoFontDescription *descr)
+{
+    data = std::make_shared<Data>();
+
+    acquire(p_font, descr);
+
+    _ascent  = _ascent_max  = 0.8;
+    _descent = _descent_max = 0.2;
+    _xheight = 0.5;
+
+    // Default baseline values, alphabetic is reference
+    _baselines[ SP_CSS_BASELINE_AUTO             ] =  0.0;
+    _baselines[ SP_CSS_BASELINE_ALPHABETIC       ] =  0.0;
+    _baselines[ SP_CSS_BASELINE_IDEOGRAPHIC      ] = -_descent;
+    _baselines[ SP_CSS_BASELINE_HANGING          ] =  0.8 * _ascent;
+    _baselines[ SP_CSS_BASELINE_MATHEMATICAL     ] =  0.8 * _xheight;
+    _baselines[ SP_CSS_BASELINE_CENTRAL          ] =  0.5 - _descent;
+    _baselines[ SP_CSS_BASELINE_MIDDLE           ] =  0.5 * _xheight;
+    _baselines[ SP_CSS_BASELINE_TEXT_BEFORE_EDGE ] = _ascent;
+    _baselines[ SP_CSS_BASELINE_TEXT_AFTER_EDGE  ] = -_descent;
+
+    init_face();
+
+    find_font_metrics();
+}
+
+FontInstance::~FontInstance()
+{
+    release();
+}
+
+/*
+ * The following two functions isolate all the C-style resource ownership logic.
+ */
+
+// Either acquires all the necessary pointers to resources, or acquires nothing and throws CtorException.
+void FontInstance::acquire(PangoFont *p_font_, PangoFontDescription *descr_)
+{
+    p_font = p_font_;
+    descr = descr_;
+    descr_hash = pango_font_description_hash(descr);
+    hb_font_copy = nullptr;
+    face = nullptr;
+    data->cairo_font_face = nullptr;
+
+    hb_font = pango_font_get_hb_font(p_font); // Pango owns hb_font.
+    if (!hb_font) {
+        release();
+        throw CtorException("Failed to get harfbuzz font");
+    }
+
+#ifdef WITH_HARFBUZZ_CAIRO
+    // Used for rendering color fonts.
+    data->cairo_font_face = hb_cairo_font_face_create_for_font(hb_font);
+    if (!data->cairo_font_face) {
+        release();
+        throw CtorException("Failed to get cairo font face");
+    }
+#endif
+
+    // hb_font is immutable, yet we need to act on it (with set_funcs) to extract the freetype face
+    hb_font_copy = hb_font_create_sub_font(hb_font);
+    hb_ft_font_set_funcs(hb_font_copy);
+    hb_face = hb_font_get_face(hb_font);
+
+    face = hb_ft_font_lock_face(hb_font_copy);
+    if (!face) {
+        release();
+        throw CtorException("Failed to get freetype face");
+    }
+}
+
+// Release the resources acquired by acquire().
+void FontInstance::release()
+{
+    if (hb_font_copy) {
+        if (face) {
+            hb_ft_font_unlock_face(hb_font_copy);
+        }
+        hb_font_destroy(hb_font_copy);
+    }
+
+#ifdef WITH_HARFBUZZ_CAIRO
+    if (data->cairo_font_face) {
+        cairo_font_face_destroy(data->cairo_font_face);
+    }
+#endif
+
+    pango_font_description_free(descr);
+    g_object_unref(p_font);
+}
+
+// Compose an OpenType font tag from a string.
+uint32_t compose_tag(Glib::ustring tag_name) {
+    if (tag_name.size() != 4) {
+        std::cerr << "compose_tag: '" << tag_name << "' not four characters!" << std::endl;
+        return 0;
+    }
+
+    return
+        tag_name[0] << 24 +
+        tag_name[1] << 16 +
+        tag_name[2] <<  8 +
+        tag_name[3];
+}
+
+void FontInstance::init_face()
+{
+    if (debug_color_fonts) {
+      std::cout << "FontInstance::init_face: " << pango_font_description_to_string(descr) << ":" << std::endl;
+    }
+    auto hb_font = pango_font_get_hb_font(p_font); // Pango owns hb_font.
+    assert(hb_font); // Guaranteed since already tested in acquire().
+
+    if (debug_color_fonts) {
+        readOpenTypeTableList(hb_font, openTypeTableList);
+        std::cout << "  OpenType Table list: ";
+        for (const auto& table : openTypeTableList) {
+            std::cout << table << ", ";
+        }
+        std::cout << std::endl;
+    }
+
+    has_svg    = hb_ot_color_has_svg(hb_face);    // SVG glyphs         HB 2.1.0
+    has_png    = hb_ot_color_has_png(hb_face);    // Color png glyphs   HB 2.1.0
+    has_layers = hb_ot_color_has_layers(hb_face); // Has COLRv0 table.  HB 2.1.0
+    has_paint  = hb_ot_color_has_paint(hb_face);  // Has COLRv1 table.  HB 7.0.0
+
+    if (debug_color_fonts) {
+        std::cout << "  " << pango_font_description_to_string(descr)
+                  << "  Has SVG: "    << std::setw(5) << std::boolalpha << has_svg
+                  << "  Has PNG: "    << std::setw(5) << std::boolalpha << has_png
+                  << "  Has COLRv0: " << std::setw(5) << std::boolalpha << has_layers
+                  << "  Has COLRv1: " << std::setw(5) << std::boolalpha << has_paint
+                  << std::endl;
+    }
+
+    readOpenTypeTableList(hb_font, openTypeTableList);
+    _has_vertical = openTypeTableList.contains("vmtx") && openTypeTableList.contains("vhea");
+
+    if (has_svg) {
+        readOpenTypeSVGTable(hb_font, data->openTypeSVGGlyphs, data->openTypeSVGData);
+    }
+
+    if (debug_color_fonts) {
+        // This dumps PNGs to files for inspection.
+        std::vector<Glib::RefPtr<Gdk::Pixbuf>> pixbufs;
+        if (has_png) {
+            readOpenTypePNG(hb_font, pixbufs);
+        }
+    }
+
+    readOpenTypeFvarAxes(hb_font, data->openTypeVarAxes);
+}
+
+inline double FTFixedToDouble (FT_Fixed value) {
+    return static_cast<FT_Int32>(value) / 65536.0;
+}
+
+// Internal function to find baselines
+void FontInstance::find_font_metrics()
+{
+    // TO DO: Convert this whole section to using HarfBuzz. Harfbuzz has more complete fallback
+    // provisions and as an industrial standard, it will be more consistent with other programs.
+
+    // CSS2 recommends using the OS/2 values sTypoAscender and sTypoDescender for the Typographic ascender and descender values:
+    //   http://www.w3.org/TR/CSS2/visudet.html#sTypoAscender
+    // On Windows, the typographic ascender and descender are taken from the otmMacAscent and
+    // otmMacDescent values:
+    //   http://microsoft.public.win32.programmer.gdi.narkive.com/LV6k4BDh/msdn-documentation-outlinetextmetrics-clarification
+    // The otmAscent and otmDescent values are the maximum ascent and maximum descent of all the glyphs in a font.
+
+    int x_scale, y_scale;
+    hb_font_get_scale(hb_font, &x_scale, &y_scale);
+
+    if (face->units_per_EM != 0) {  // If zero then it's a bitmap font.
+
+        auto os2 = (TT_OS2*)FT_Get_Sfnt_Table(face, ft_sfnt_os2);
+
+        if (auto post = (TT_Postscript*)FT_Get_Sfnt_Table(face, ft_sfnt_post)) {
+            _italic_angle = FTFixedToDouble(post->italicAngle);
+            _fixed_width = post->isFixedPitch != 0;
+            // fsSelection mask: oblique/italic = 0x201
+            _oblique = post->italicAngle != 0 || (os2 && (os2->fsSelection & 0x201) != 0);
+        }
+
+        if (os2) {
+            _family_class = os2->sFamilyClass;
+            _ascent  = std::fabs((double)os2->sTypoAscender / face->units_per_EM);
+            _descent = std::fabs((double)os2->sTypoDescender/ face->units_per_EM);
+        } else {
+            _ascent  = std::fabs((double)face->ascender  / face->units_per_EM);
+            _descent = std::fabs((double)face->descender / face->units_per_EM);
+        }
+        _ascent_max  = std::fabs((double)face->ascender  / face->units_per_EM);
+        _descent_max = std::fabs((double)face->descender / face->units_per_EM);
+        _design_units = face->units_per_EM;
+
+        // In CSS em size is ascent + descent... which should be 1. If not, adjust so it is.
+        double em = _ascent + _descent;
+        if (em > 0.0) {
+            _ascent /= em;
+            _descent /= em;
+        }
+
+        // x-height: If not set in font, position of top of 'x' relative to alphabetic baseline.
+        hb_position_t xheight_int = -999; // Dummy number, HB will fill.
+        hb_ot_metrics_get_position_with_fallback(hb_font, HB_OT_METRICS_TAG_X_HEIGHT, &xheight_int);
+        double _xheight = xheight_int / (double)y_scale;
+
+        // TO DO: Harfbuzz has better code to do this. (hb-ot-layout.cc)
+        // Baselines defined relative to  alphabetic.
+        _baselines[ SP_CSS_BASELINE_IDEOGRAPHIC      ] = -_descent;      // Recommendation
+        _baselines[ SP_CSS_BASELINE_HANGING          ] = 0.8 * _ascent;  // Guess
+        _baselines[ SP_CSS_BASELINE_MATHEMATICAL     ] = 0.8 * _xheight; // Guess
+        _baselines[ SP_CSS_BASELINE_CENTRAL          ] = 0.5 - _descent; // Definition
+        _baselines[ SP_CSS_BASELINE_MIDDLE           ] = 0.5 * _xheight; // Definition
+        _baselines[ SP_CSS_BASELINE_TEXT_BEFORE_EDGE ] = _ascent;        // Definition
+        _baselines[ SP_CSS_BASELINE_TEXT_AFTER_EDGE  ] = -_descent;      // Definition
+
+        // Better math baseline:
+        // Try center of minus sign
+        FT_UInt index = FT_Get_Char_Index(face, 0x2212); //'−'
+        // If no minus sign, try hyphen
+        if (index == 0) {
+            index = FT_Get_Char_Index(face, '-');
+        }
+
+        if (index != 0) {
+            FT_Load_Glyph(face, index, FT_LOAD_NO_SCALE);
+            FT_Glyph aglyph;
+            FT_Get_Glyph(face->glyph, &aglyph);
+            FT_BBox acbox;
+            FT_Glyph_Get_CBox(aglyph, FT_GLYPH_BBOX_UNSCALED, &acbox);
+            double math = (double)(acbox.yMin + acbox.yMax) / 2.0 / face->units_per_EM;
+            _baselines[ SP_CSS_BASELINE_MATHEMATICAL ] = math;
+            // std::cout << "Math baseline: - bbox: y_min: " << acbox.yMin
+            //           << "  y_max: " << acbox.yMax
+            //           << "  math: " << math << std::endl;
+            FT_Done_Glyph(aglyph);
+        }
+
+        // Find hanging baseline... assume it is at top of 'म'.
+        index = FT_Get_Char_Index(face, 0x092E); // 'म'
+        if (index != 0) {
+            FT_Load_Glyph(face, index, FT_LOAD_NO_SCALE);
+            FT_Glyph aglyph;
+            FT_Get_Glyph(face->glyph, &aglyph);
+            FT_BBox acbox;
+            FT_Glyph_Get_CBox(aglyph, FT_GLYPH_BBOX_UNSCALED, &acbox);
+            double hanging = (double)acbox.yMax / face->units_per_EM;
+            _baselines[ SP_CSS_BASELINE_HANGING ] = hanging;
+            // std::cout << "Hanging baseline:  प: " << hanging << std::endl;
+            FT_Done_Glyph(aglyph);
+        }
+    } else {
+        _design_units = hb_face_get_upem(hb_face);
+    }
+
+    // Sources and fallbacks are defined in hb-ot-metrics.cc
+    hb_position_t underline_position_int    = -999;
+    hb_position_t underline_thickness_int   = -999;
+    hb_position_t linethrough_position_int  = -999;
+    hb_position_t linethrough_thickness_int = -999;
+    hb_position_t ascender_int              = -999;
+    hb_ot_metrics_get_position_with_fallback(hb_font, HB_OT_METRICS_TAG_UNDERLINE_OFFSET, &underline_position_int);
+    hb_ot_metrics_get_position_with_fallback(hb_font, HB_OT_METRICS_TAG_UNDERLINE_SIZE,   &underline_thickness_int);
+    hb_ot_metrics_get_position_with_fallback(hb_font, HB_OT_METRICS_TAG_STRIKEOUT_OFFSET, &linethrough_position_int);
+    hb_ot_metrics_get_position_with_fallback(hb_font, HB_OT_METRICS_TAG_STRIKEOUT_SIZE,   &linethrough_thickness_int);
+    hb_ot_metrics_get_position_with_fallback(hb_font, HB_OT_METRICS_TAG_HORIZONTAL_ASCENDER, &ascender_int);
+
+    _underline_position    = underline_position_int    / (double)y_scale;
+    _underline_thickness   = underline_thickness_int   / (double)y_scale;
+    _linethrough_position  = linethrough_position_int  / (double)y_scale;
+    _linethrough_thickness = linethrough_thickness_int / (double)y_scale;
+    _overline_position     = ascender_int              / (double)y_scale;
+    _overline_thickness    = _underline_thickness;
+
+    // Postscript table gives underline center postion, but Harfbuzz translate it to top of
+    // underline.  This might make sense (the space between the baseline and top of the underline
+    // remains fixed), however, to be consistent with previous behavior (from Freetype) and with
+    // Firefox, move the position back to center.
+    _underline_position -= _underline_thickness/2.0;
+
+    // const gchar *family = pango_font_description_get_family(descr);
+    // std::cout << "Font: " << (family?family:"null") << std::endl;
+    // std::cout << "  ascent:      " << _ascent      << std::endl;
+    // std::cout << "  descent:     " << _descent     << std::endl;
+    // std::cout << "  x-height:    " << _xheight     << std::endl;
+    // std::cout << "  max ascent:  " << _ascent_max  << std::endl;
+    // std::cout << "  max descent: " << _descent_max << std::endl;
+    // std::cout << "  underline_position:    " << _underline_position    <<  std::endl;
+    // std::cout << "  underline_thickness:   " << _underline_thickness   <<  std::endl;
+    // std::cout << "  linethrough_position:  " << _linethrough_position  <<  std::endl;
+    // std::cout << "  linethrough_thickness: " << _linethrough_thickness <<  std::endl;
+    // std::cout << "  overline_position:     " << _overline_position     <<  std::endl;
+    // std::cout << "  overline_thickness:    " << _overline_thickness    <<  std::endl;
+
+    // std::cout << " Baselines:" << std::endl;
+    // std::cout << "  alphabetic:  " << _baselines[ SP_CSS_BASELINE_ALPHABETIC       ] << std::endl;
+    // std::cout << "  ideographic: " << _baselines[ SP_CSS_BASELINE_IDEOGRAPHIC      ] << std::endl;
+    // std::cout << "  hanging:     " << _baselines[ SP_CSS_BASELINE_HANGING          ] << std::endl;
+    // std::cout << "  math:        " << _baselines[ SP_CSS_BASELINE_MATHEMATICAL     ] << std::endl;
+    // std::cout << "  central:     " << _baselines[ SP_CSS_BASELINE_CENTRAL          ] << std::endl;
+    // std::cout << "  middle:      " << _baselines[ SP_CSS_BASELINE_MIDDLE           ] << std::endl;
+    // std::cout << "  text_before: " << _baselines[ SP_CSS_BASELINE_TEXT_BEFORE_EDGE ] << std::endl;
+    // std::cout << "  text_after:  " << _baselines[ SP_CSS_BASELINE_TEXT_AFTER_EDGE  ] << std::endl;
+}
+
+std::vector<FontInstance::CharInfo> FontInstance::find_all_characters(uint32_t from, uint32_t to) const {
+    std::vector<CharInfo> characters;
+
+    FT_UInt glyph_index;
+    auto unicode = FT_Get_First_Char(face, &glyph_index);
+    while (glyph_index) {
+        if (unicode >= from && unicode <= to) {
+            characters.push_back(CharInfo(unicode, glyph_index));
+        }
+
+        unicode = FT_Get_Next_Char(face, unicode, &glyph_index);
+    }
+
+    return characters;
+}
+
+unsigned int FontInstance::MapUnicodeChar(gunichar c) const
+{
+    unsigned int res = 0;
+    if (c > 0x10ffff) {
+        // >= 0xf0000 is out of range for assigned codepoints, above is for private use.
+        std::cerr << "FontInstance::MapUnicodeChar: Unicode codepoint out of range: "
+                  << std::hex << c << std::dec
+                  << std::endl;
+    } else {
+        res = FT_Get_Char_Index(face, c);
+    }
+    return res;
+}
+
+// The purpose of this function is to extract and cache:
+// * glyph metrics (for text layout and selection ),
+// * glyph paths (for non-color fonts to allow for pattern fills, etc.).
+FontGlyph const *FontInstance::LoadGlyph(unsigned int glyph_id)
+{
+    if (glyph_id == 0xfffffff || (glyph_id & PANGO_GLYPH_UNKNOWN_FLAG)) {
+        // Pango value for zero-width empty glyph that we can ignore (e.g. 0xFE0F, Emoji variant selector).
+        return nullptr;
+    }
+
+    if (auto it = data->glyphs.find(glyph_id); it != data->glyphs.end()) {
+        return it->second.get(); // already loaded
+    }
+
+    auto n_g = std::make_unique<FontGlyph>();
+    
+    if (debug_color_fonts) {
+        // For debugging
+        const unsigned int MAX_CHAR = 65; // Maximum length + 1 per OpenType spec.
+        char name[MAX_CHAR] = {};
+        hb_font_glyph_to_string (hb_font, glyph_id, name, MAX_CHAR);
+        n_g->unicode_name = name;
+
+        std::cout << "\nFontInstance::LoadGlyph: new: " << std::setw(6) << glyph_id
+                  << "  (" << std::setw(12) << name << ")"
+                  << "  " << pango_font_description_to_string(descr)
+                  << std::endl;
+    }
+
+    // Note: Bitmap only fonts (i.e. some color fonts) ignore FT_LOAD_NO_BITMAP.
+    if (FT_Load_Glyph(face, glyph_id, FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP)) {
+        return nullptr; // error
+    }
+
+    // Use harfbuzz value as FreeType doesn't return value for bitmap fonts.
+    // auto units_per_em = hb_face_get_upem(hb_face);
+
+    // Find scale, used by both metrics and paths.
+    int x_scale = 0;
+    int y_scale = 0;
+    hb_font_get_scale(hb_font, &x_scale, &y_scale);
+    if (x_scale != y_scale) {
+        std::cerr << "FontInstance::LoadGlyph: x scale not equal to y scale!" << std::endl;
+    }
+
+    // Find metrics ----------------------------------
+
+    n_g->h_advance = hb_font_get_glyph_h_advance (hb_font, glyph_id) / (double)x_scale; // Since HB 0.9.2
+    if (openTypeTableList.contains("vmtx")) {
+        n_g->v_advance = -hb_font_get_glyph_v_advance (hb_font, glyph_id) / (double)y_scale;
+    } else {
+        // Don't use harfbuzz synthisized vertical metrics, it's wrong (includes line gap?)!
+        // CSS3 Writing modes dictates that if vertical font metrics are missing we must
+        // synthisize them. No method is specified. The SVG 1.1 spec suggests using the em
+        // height (which is not theFace->height as that includes leading). The em height
+        // is ascender + descender (descender positive).  Note: The "Requirements for
+        // Japanese Text Layout" W3C document says that Japanese kanji should be "set
+        // solid" which implies that vertical (and horizontal) advance should be 1em.
+        n_g->v_advance = 1.0;
+    }
+
+    hb_glyph_extents_t extents;
+    bool success = hb_font_get_glyph_extents(hb_font, glyph_id, &extents); // Since HB 0.9.2
+    if (success) {
+        n_g->bbox_exact = Geom::Rect(extents.x_bearing / (double)x_scale,
+                                     extents.y_bearing / (double)y_scale,
+                                    (extents.x_bearing + extents.width) / (double)x_scale,
+                                    (extents.y_bearing + extents.height) / (double)y_scale);
+    } else {
+        std::cerr << "FontInstance::LoadGlyph: Failed to get glyph extents for glyph: glyph_id!"
+                  << "  (" << pango_font_description_to_string(descr) << ")"
+                  << std::endl;
+    }
+
+    // Pick box: same as exact bbox but subject to a minimum size (advance width x half em-box height).
+    n_g->bbox_pick = n_g->bbox_exact;
+    n_g->bbox_pick.unionWith(Geom::Rect::from_xywh(0.0, 0.0, n_g->h_advance, 0.5)); // Insure minimum size.
+
+    // Any place that might be inked, including any text decoration.
+    n_g->bbox_draw.setRight(n_g->h_advance);       // Advance
+    n_g->bbox_draw.setBottom( std::max( _ascent_max,   _overline_position  + 3 * _overline_thickness)); // Expand to allow for text decoration
+    n_g->bbox_draw.setTop(    std::min(-_descent_max, -_underline_position - 3 * _underline_thickness));
+    n_g->bbox_draw.unionWith(n_g->bbox_exact);     // Extend if glyph leaks outside of design space.
+
+    // Find path vector ------------------------------
+
+    // Move this out of loop?
+    auto dfuncs = hb_draw_funcs_create();
+    hb_draw_funcs_set_move_to_func     (dfuncs, (hb_draw_move_to_func_t)     hb_draw_move_to,      NULL, NULL);
+    hb_draw_funcs_set_line_to_func     (dfuncs, (hb_draw_line_to_func_t)     hb_draw_line_to,      NULL, NULL);
+    hb_draw_funcs_set_quadratic_to_func(dfuncs, (hb_draw_quadratic_to_func_t)hb_draw_quadratic_to, NULL, NULL);
+    hb_draw_funcs_set_cubic_to_func    (dfuncs, (hb_draw_cubic_to_func_t)    hb_draw_cubic_to,     NULL, NULL);
+    hb_draw_funcs_set_close_path_func  (dfuncs, (hb_draw_close_path_func_t)  hb_draw_close_path,   NULL, NULL);
+    hb_draw_funcs_make_immutable (dfuncs);
+
+    Geom::PathBuilder path_builder_hb;
+    HBGeomData draw_data(path_builder_hb, 1.0/x_scale);
+    hb_font_draw_glyph(hb_font, glyph_id, dfuncs, &draw_data);
+    hb_draw_funcs_destroy(dfuncs);
+
+    path_builder_hb.flush();
+    Geom::PathVector pv = path_builder_hb.peek();
+
+    if (!pv.empty()) {
+        n_g->pathvector = std::move(pv);
+    }
+
+    // From pango shape.c
+    if (hb_ot_color_has_svg(hb_face)) {
+        auto blob = hb_ot_color_glyph_reference_svg (hb_face, glyph_id); // Note face!
+        if (blob) {
+            auto length = hb_blob_get_length(blob);
+            hb_blob_destroy(blob);
+            if (length > 0) {
+                n_g->has_svg = true;
+            }
+        }
+    };
+
+    if (hb_ot_color_has_png(hb_face)) {
+        auto blob = hb_ot_color_glyph_reference_png (hb_font, glyph_id); // Note face!
+        if (blob) {
+            auto length = hb_blob_get_length(blob);
+            hb_blob_destroy(blob);
+            if (length > 0) {
+                n_g->has_png = true;
+            }
+        }
+    };
+
+    n_g->has_layers = hb_ot_color_glyph_get_layers(hb_face, glyph_id, 0, NULL, NULL) > 0;
+    n_g->has_paint  = hb_ot_color_glyph_has_paint(hb_face, glyph_id);
+
+    auto ret = data->glyphs.emplace(glyph_id, std::move(n_g));
+
+    return ret.first->second.get();
+}
+
+/**
+ * Attempt to get the ttf filename for this font instance. If this is a memory font, then blank will be returned.
+ */
+Glib::ustring FontInstance::GetFilename() const
+{
+    if (p_font) {
+        if (PangoFcFont *fc_font = PANGO_FC_FONT(p_font)) {
+            char *fn;
+            if (FcPatternGetString(fc_font->font_pattern, FC_FILE, 0, (FcChar8 **)&fn)== FcResultMatch) {
+                Glib::ustring out(fn);
+#ifdef _WIN32
+                // Filenames from fontconfig something have backslashes on windows instead of forward slashes.
+                for (auto ind = out.find('/'); ind != Glib::ustring::npos; ind = out.find('/')) {
+                    out.replace(ind, 1, "\\");
+                }
+#endif
+                return out;
+            }
+        }
+    }
+    return "";
+}
+
+bool FontInstance::FontMetrics(double &ascent, double &descent, double &xheight) const
+{
+    ascent = _ascent;
+    descent = _descent;
+    xheight = _xheight;
+
+    return true;
+}
+
+void FontInstance::FontDecoration(double &underline_position,   double &underline_thickness,
+                                  double &linethrough_position, double &linethrough_thickness,
+                                  double &overline_position,    double &overline_thickness) const
+{
+    underline_position    = _underline_position;
+    underline_thickness   = _underline_thickness;
+    linethrough_position  = _linethrough_position;
+    linethrough_thickness = _linethrough_thickness;
+    overline_position     = _overline_position;
+    overline_thickness    = _overline_thickness;
+}
+
+bool FontInstance::FontSlope(double &run, double &rise) const
+{
+    run = 0.0;
+    rise = 1.0;
+
+    if (!FT_IS_SCALABLE(face)) {
+        return false; // bitmap font
+    }
+
+    auto hhea = reinterpret_cast<TT_HoriHeader*>(FT_Get_Sfnt_Table(face, ft_sfnt_hhea));
+    if (!hhea) {
+        return false;
+    }
+    run = hhea->caret_Slope_Run;
+    rise = hhea->caret_Slope_Rise;
+
+    return true;
+}
+
+Geom::Rect FontInstance::BBoxExact(unsigned int glyph_id)
+{
+    auto g = LoadGlyph(glyph_id);
+    if (!g) {
+        return {};
+    }
+
+    return g->bbox_exact;
+}
+
+Geom::Rect FontInstance::BBoxPick(unsigned int glyph_id)
+{
+    auto g = LoadGlyph(glyph_id);
+    if (!g) {
+        return {0, 0, 1, 1}; // em box
+    }
+
+    return g->bbox_pick;
+}
+
+Geom::Rect FontInstance::BBoxDraw(unsigned int glyph_id)
+{
+    auto g = LoadGlyph(glyph_id);
+    if (!g) {
+        return {};
+    }
+
+    return g->bbox_draw;
+}
+
+bool FontInstance::GlyphHasSVG(unsigned int glyph_id)
+{
+    auto g = LoadGlyph(glyph_id);
+    if (!g) {
+        return false;
+    }
+
+    return g->has_svg;
+}
+
+bool FontInstance::GlyphHasPNG(unsigned int glyph_id)
+{
+    auto g = LoadGlyph(glyph_id);
+    if (!g) {
+        return false;
+    }
+
+    return g->has_png;
+}
+
+bool FontInstance::GlyphHasLayers(unsigned int glyph_id)
+{
+    auto g = LoadGlyph(glyph_id);
+    if (!g) {
+        return false;
+    }
+
+    return g->has_layers;
+}
+
+bool FontInstance::GlyphHasPaint(unsigned int glyph_id)
+{
+    auto g = LoadGlyph(glyph_id);
+    if (!g) {
+        return false;
+    }
+
+    return g->has_paint;
+}
+
+// Only used for debugging
+std::string FontInstance::UnicodeName(unsigned int glyph_id)
+{
+    auto g = LoadGlyph(glyph_id);
+    if (!g) {
+        return std::string("Glyph missing");
+    }
+
+    return g->unicode_name;
+}
+
+Geom::PathVector const *FontInstance::PathVector(unsigned int glyph_id)
+{
+    auto g = LoadGlyph(glyph_id);
+    if (!g) {
+        return nullptr;
+    }
+
+    return &g->pathvector;
+}
+
+Glib::ustring FontInstance::SvgDocument(unsigned int glyph_id)
+{
+    auto glyph_iter = data->openTypeSVGGlyphs.find(glyph_id);
+    if (glyph_iter == data->openTypeSVGGlyphs.end()) {
+        return Glib::ustring(); // out of range
+    }
+
+    // Glyphs are layed out in the +x, -y quadrant (assuming viewBox origin is 0,0).
+    // We need to shift the viewBox by the height inorder to generate pixbuf!
+    // To do: glyphs must draw overflow so we actually need larger pixbuf!
+    // To do: Error handling.
+
+    Glib::ustring svg = data->openTypeSVGData[glyph_iter->second.entry_index];
+
+    auto glyphBox = BBoxDraw(glyph_id) * Geom::Scale(_design_units);
+    // Don't use Rect.roundOutwards/Inwards, most dimensions in font description are in design_units which are integers.
+    // Multiplying by design_units should give close to original integers and should use traditional rounding.
+    Geom::IntRect box(std::lround(glyphBox.left()), std::lround(glyphBox.top()), std::lround(glyphBox.right()),
+                      std::lround(glyphBox.bottom()));
+
+    // Create new viewbox which determines pixbuf size.
+    std::ostringstream svg_stream;
+    svg_stream.imbue(std::locale::classic());
+    svg_stream << "viewBox=\"" << box.min().x() << " " << -box.max().y() << " " << box.width() << " " << box.height()
+               << "\"";
+    Glib::ustring viewbox = svg_stream.str();
+
+    // Search for existing viewbox
+    static auto regex = Glib::Regex::create("viewBox=\"\\s*(\\d*\\.?\\d+)\\s*,?\\s*(\\d*\\.?\\d+)\\s*,?\\s*(\\d+\\.?\\d+)\\s*,?\\s*(\\d+\\.?\\d+)\\s*\"", Glib::Regex::CompileFlags::OPTIMIZE);
+    Glib::MatchInfo matchInfo;
+    regex->match(svg, matchInfo);
+
+    if (matchInfo.matches() && matchInfo.get_match_count() != 5) { // Number of matches plus original string.
+        std::cerr << "FontInstance::SVGDocument: Found viewBox but didn't find four numbers! glyph: " << glyph_id
+                  << "  count: " << matchInfo.get_match_count()
+                  << "  svg: " << svg << std::endl;
+    }
+    if (matchInfo.matches() && matchInfo.get_match_count() == 5) {
+
+        // We have viewBox! We must transform so viewBox corresponds to design units.
+        // Get box before we change svg string.
+        double x = Glib::Ascii::strtod(matchInfo.fetch(1));
+        double y = Glib::Ascii::strtod(matchInfo.fetch(2));
+        double w = Glib::Ascii::strtod(matchInfo.fetch(3));
+        double h = Glib::Ascii::strtod(matchInfo.fetch(4));
+        // std::cout << " x: " << x
+        //           << " y: " << y
+        //           << " w: " << w
+        //           << " h: " << h << std::endl;
+
+        // Replace viewbox
+        svg = regex->replace_literal(svg, 0, viewbox, static_cast<Glib::Regex::MatchFlags>(0));
+
+        // Insert group with required transform to map glyph to new viewbox.
+
+        if (w <= 0.0 || h <= 0.0) {
+            std::cerr << "FontInstance::PixBuf: Invalid glyph width or height!" << std::endl;
+        } else {
+
+            double xscale = _design_units/w;
+            double yscale = _design_units/h;
+            double xtrans = _design_units/w * x;
+            double ytrans = _design_units/h * y;
+
+            if (xscale != 1.0 || yscale != 1.0 || xtrans != 0 || ytrans != 0) {
+                svg_stream.str("");
+                svg_stream << "<g transform=\"matrix(" << xscale << ", 0, 0, " << yscale << ", " << -xtrans << ", "
+                           << -ytrans << ")\">";
+                Glib::ustring group = svg_stream.str();
+
+                // Insert start group tag after initial <svg>
+                Glib::RefPtr<Glib::Regex> regex =
+                    Glib::Regex::create("<\\s*svg.*?>", Glib::Regex::CompileFlags::DOTALL);
+                regex->match(svg, matchInfo);
+                if (matchInfo.matches()) {
+                    int start = -1;
+                    int end   = -1;
+                    matchInfo.fetch_pos(0, start, end);
+                    svg.insert(end, group);
+                } else {
+                    std::cerr << "FontInstance::PixBuf: Could not find <svg> tag!" << std::endl;
+                }
+
+                // Insert end group tag before final </svg> (To do: make sure it is final </svg>)
+                regex = Glib::Regex::create("<\\s*\\/\\s*svg.*?>");
+                regex->match(svg, matchInfo);
+                if (matchInfo.matches()) {
+                    int start = -1;
+                    int end   = -1;
+                    matchInfo.fetch_pos(0, start, end);
+                    svg.insert(start, "</g>");
+                } else {
+                    std::cerr << "FontInstance::PixBuf: Could not find </svg> tag!" << std::endl;
+                }
+            }
+        }
+
+    } else {
+        // No viewBox! We insert one. (To do: Look at 'width' and 'height' to see if we must scale.)
+        Glib::RefPtr<Glib::Regex> regex = Glib::Regex::create("<\\s*svg");
+        viewbox.insert(0, "<svg ");
+        svg = regex->replace_literal(svg, 0, viewbox, static_cast<Glib::Regex::MatchFlags>(0));
+    }
+
+    // Make glyph visible.
+    auto pattern = Glib::ustring::compose("(id=\"\\s*glyph%1\\s*\")\\s*visibility=\"hidden\"", glyph_id);
+    auto regex2 = Glib::Regex::create(pattern, Glib::Regex::CompileFlags::OPTIMIZE);
+    return regex2->replace(svg, 0, "\\1", static_cast<Glib::Regex::MatchFlags>(0));
+}
+
+std::string FontInstance::GlyphSvg(unsigned int glyph_id)
+{
+    auto glyph_iter = data->openTypeSVGGlyphs.find(glyph_id);
+    if (glyph_iter == data->openTypeSVGGlyphs.end()) {
+        return "";
+    }
+    return data->openTypeSVGData[glyph_iter->second.entry_index];
+}
+
+double FontInstance::Advance(unsigned int glyph_id, bool vertical)
+{
+    auto g = LoadGlyph(glyph_id);
+    if (!g) {
+        return 0;
+    }
+
+    return vertical ? g->v_advance : g->h_advance;
+}
+
+std::map<Glib::ustring, OTSubstitution> const &FontInstance::get_opentype_tables()
+{
+    if (!data->openTypeTables) {
+        auto hb_font = pango_font_get_hb_font(p_font);
+        assert(hb_font);
+
+        data->openTypeTables.emplace();
+        readOpenTypeGsubTable(hb_font, *data->openTypeTables);
+    }
+
+    return *data->openTypeTables;
+}
+
+/*
+ Local Variables:
+ mode:c++
+ c-file-style:"stroustrup"
+ c-file-offsets:((innamespace . 0)(inline-open . 0)(case-label . +))
+ indent-tabs-mode:nil
+ fill-column:99
+ End:
+ */
+// vim: filetype=cpp:expandtab:shiftwidth=4:tabstop=8:softtabstop=4 :
